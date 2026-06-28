@@ -1,0 +1,128 @@
+diff --git a/deepspec/data/parser.py b/deepspec/data/parser.py
+index e7828dc..99b66fd 100644
+--- a/deepspec/data/parser.py
++++ b/deepspec/data/parser.py
+@@ -50,6 +50,22 @@ TEMPLATE_REGISTRY.register(
+     ),
+ )
+ 
++# GLM-5.2 (GlmMoeDsa). The tokenizer renders:
++#   [gMASK]<sop>\n<|system|>Reasoning Effort: Medium-high<|user|>{u}<|assistant|><think></think>{a}
++# No explicit assistant-end token — the next <|user|> (or end-of-string) delimits the turn. We keep
++# system_prompt=None (the tokenizer template injects its own "Reasoning Effort" system) and put loss
++# on the whole assistant body incl. the (empty for thinking-off) <think></think> + answer.
++TEMPLATE_REGISTRY.register(
++    "glm",
++    ChatTemplate(
++        assistant_header="<|assistant|>",
++        user_header="<|user|>",
++        system_prompt=None,
++        end_of_turn_token="<|user|>",
++        assistant_loss_prefix=None,
++    ),
++)
++
+ 
+ class GeneralParser:
+     def __init__(self, tokenizer, chat_template):
+diff --git a/deepspec/trainer/__init__.py b/deepspec/trainer/__init__.py
+index 5ed28b0..6a51fdc 100644
+--- a/deepspec/trainer/__init__.py
++++ b/deepspec/trainer/__init__.py
+@@ -1,11 +1,12 @@
+ from .base_trainer import BaseTrainer
+-from .dspark_trainer import Gemma4DSparkTrainer, Qwen3DSparkTrainer
++from .dspark_trainer import Gemma4DSparkTrainer, GlmDSparkTrainer, Qwen3DSparkTrainer
+ from .eagle3_trainer import Gemma4Eagle3Trainer, Qwen3Eagle3Trainer
+ 
+ __all__ = [
+     "BaseTrainer",
+     "Gemma4Eagle3Trainer",
+     "Gemma4DSparkTrainer",
++    "GlmDSparkTrainer",
+     "Qwen3Eagle3Trainer",
+     "Qwen3DSparkTrainer",
+ ]
+diff --git a/deepspec/trainer/base_trainer.py b/deepspec/trainer/base_trainer.py
+index 1a03dc8..dbd0a5a 100644
+--- a/deepspec/trainer/base_trainer.py
++++ b/deepspec/trainer/base_trainer.py
+@@ -251,27 +251,39 @@ class BaseTrainer:
+             model_args.target_model_name_or_path,
+         )
+ 
+-        draft_model = self._build_draft_model(
+-            target_config=target_config,
+-            model_args=model_args,
+-        )
+-        draft_model = draft_model.to(device=self.device, dtype=self.precision_dtype)
++        # Construct the draft DIRECTLY on this rank's GPU. Its own embed_tokens + lm_head are
++        # [154880,6144] each; building them on CPU in fp32 (nn defaults) spikes ~8 GB/process, and
++        # with torch.multiprocessing.spawn running one worker per GPU on a 62 GB box, 4 workers
++        # OOM-SIGKILL. A device context allocates the params on the GPU instead of host RAM.
++        with torch.device(self.device):
++            draft_model = self._build_draft_model(
++                target_config=target_config,
++                model_args=model_args,
++            )
++        draft_model = draft_model.to(dtype=self.precision_dtype)
++
++        # Training only uses the target checkpoint to initialize frozen draft embeddings + lm_head.
++        # Our NVFP4 glm_moe_dsa target can't load via AutoModelForCausalLM (custom arch + quant),
++        # so read the (unquantized BF16) embed_tokens + lm_head weights straight from the safetensors.
++        # Load each [154880,6144] weight STRAIGHT onto this rank's GPU (device=self.device) — never
++        # into CPU RAM — and skip the fp32 nn.Embedding/nn.Linear intermediates. reaper has only 62 GB
++        # RAM; with torch.multiprocessing.spawn one worker per GPU, 4 workers each materializing two
++        # fp32 [154880,6144] copies (3.8 GB ea) OOM-SIGKILLs. initialize_embeddings_and_head only reads
++        # `.weight` (shape/detach/copy_), so a SimpleNamespace wrapping the GPU tensor suffices.
++        import os as _os, json as _json, types as _types
++        from safetensors import safe_open as _safe_open
++        _mp = model_args.target_model_name_or_path
++        _idx = _json.load(open(_os.path.join(_mp, "model.safetensors.index.json")))["weight_map"]
++
++        def _load_w(_name):
++            with _safe_open(_os.path.join(_mp, _idx[_name]), framework="pt", device=str(self.device)) as _f:
++                return _f.get_tensor(_name).to(self.precision_dtype)
+ 
+-        # Training only uses the target checkpoint to initialize frozen draft
+-        # embeddings and lm_head weights.
+-        target_model = AutoModelForCausalLM.from_pretrained(
+-            model_args.target_model_name_or_path,
+-            dtype=self.precision_dtype,
+-        ).to(device="cpu").eval()
+-        target_embed_tokens = target_model.get_input_embeddings()
+-        target_lm_head = target_model.get_output_embeddings()
+-        assert (target_lm_head is not None) and (target_embed_tokens is not None)
+         draft_model.initialize_embeddings_and_head(
+-            embed_tokens=target_embed_tokens,
+-            lm_head=target_lm_head,
++            embed_tokens=_types.SimpleNamespace(weight=_load_w("model.embed_tokens.weight")),
++            lm_head=_types.SimpleNamespace(weight=_load_w("lm_head.weight")),
+             freeze=True,
+         )
+-        del target_model
+         return draft_model, tokenizer
+ 
+     def _build_draft_model(self, *, target_config, model_args):
+diff --git a/deepspec/trainer/dspark_trainer.py b/deepspec/trainer/dspark_trainer.py
+index 487e99a..fe779c4 100644
+--- a/deepspec/trainer/dspark_trainer.py
++++ b/deepspec/trainer/dspark_trainer.py
+@@ -46,3 +46,17 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
+             model_args=model_args,
+         )
+         return Gemma4DSparkModel(draft_config)
++
++
++class GlmDSparkTrainer(Qwen3DSparkTrainer):
++    """GLM-5.2 (GlmMoeDsa = MLA+DSA+MoE) target.
++
++    Lossless shortcut: the DSpark draft is target-agnostic — a standard-attention
++    transformer that consumes the target's hidden states — so Qwen3DSparkModel +
++    build_qwen3_draft_config work unchanged. build_draft_config deepcopies GLM's
++    target config (hidden 6144, vocab 154880, 64x192 heads, rope) and overrides the
++    DSpark fields; Qwen3DSparkModel reads only standard transformer fields, all of
++    which GLM's config carries, so no GLM-specific draft modeling is required.
++    """
++
++    pass

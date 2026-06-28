@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+# never commit caches / checkpoints / model weights
+*.bin
+*.safetensors
+*.idx
+cache/
+checkpoints/
+tensorboard/
+*.jsonl
