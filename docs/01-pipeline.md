@@ -62,6 +62,12 @@ Key settings inside the script (see gotchas §F): `tensor_parallel_size`, `kv_ca
 `enforce_eager=True`, **`max_model_len=16384`**, `gpu_memory_utilization=0.90`, and
 `generate(prompts=[{"prompt_token_ids": ids}])`.
 
+> **The shipped `capture_hidden_states.py` was tuned for a quantized (NVFP4) REAP target.** For a
+> **full bf16 GLM-5.2**, remove/adjust the quant-specific `LLM(...)` args: drop `quantization=...`,
+> and the `hf_overrides` `use_index_cache` / `index_topk_pattern` (those are REAP/quant-specific).
+> The hook mechanism (`dspark_hooks.py`) is unchanged — it captures the same residual streams
+> regardless of target precision. Just verify `AUX_LAYERS = [N-3, N-2, N-1]` for your layer count.
+
 ## 4. Finalize + validate
 ```bash
 python3 scripts/finalize_cache.py /cache/glm52            # manifest + dense samples.idx + renamed shards

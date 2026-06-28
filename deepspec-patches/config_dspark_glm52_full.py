@@ -36,8 +36,12 @@ model = dict(
     num_anchors=512,               # positions trained per sequence per epoch. See GOTCHAS (coverage knob).
 
     # --- Markov serial head (the DSpark corrector; reused verbatim from DeepSpec) ---
-    markov_rank=512,               # V4-Pro = 512 (hidden 7168 ~ GLM 6144). V4-Flash = 256 @ hidden 4096.
-    markov_head_type="vanilla",    # V4 production.
+    # >>EDIT/VERIFY: markov_rank scales with hidden size and is the ONE knob where Flash and Pro
+    # differ. V4-Flash = 256 (hidden 4096); V4-Pro = 512 (hidden 7168). GLM hidden 6144 sits between.
+    # We default 512 (Pro-lean). **To match DeepSeek-V4-Flash-DSpark literally, set 256.**
+    # Cross-check against the actual DeepSeek-V4-Flash-DSpark/config.json before a big run.
+    markov_rank=512,
+    markov_head_type="vanilla",    # V4 production (same for Flash and Pro).
 
     # --- Confidence head ---
     confidence_head_alpha=1.0,

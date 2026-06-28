@@ -36,15 +36,24 @@ versa. **Capture from the model you will actually serve.** (See [gotchas](docs/0
 
 ## Why this is 1:1 with the paper — and why the GLM changes don't break that
 
-Every difference from DeepSeek's literal config falls into one of four buckets. The
-**method-defining knobs are identical**; everything else is either **forced by GLM's architecture**
-(same role, different value) or a **training-logistics adaptation** that provably doesn't change
-what the draft learns. We followed their research to the letter and only changed what the target
-*made* us change.
+**First, an honest framing:** you cannot make GLM-5.2 a *byte-for-byte* clone of
+`DeepSeek-V4-Flash-DSpark` — GLM-5.2 is a **different, larger** model (hidden 6144 vs Flash's 4096,
+78 layers, 154880 vocab). What you reproduce is the **method/recipe 1:1**, producing GLM's
+*equivalent* of Flash-DSpark. The dimension-dependent knobs (`markov_rank`, `target_layer_ids`,
+`hidden`, `vocab`) **must** differ because the model differs — that's faithful, not a deviation.
+
+> **Verify two numbers against the real repo before a big run:** `markov_rank` and the
+> `target_layer_ids` pattern, from `DeepSeek-V4-Flash-DSpark/config.json` (and `-Pro-`). The values
+> here are from a prior reading of those configs, not re-pulled — cross-check them.
+
+Every difference from DeepSeek's config then falls into one of four buckets. The **method-defining
+knobs are identical**; everything else is either **forced by GLM's architecture** (same role,
+different value) or a **training-logistics adaptation** that provably doesn't change what the draft
+learns.
 
 ### 1. Identical to the recipe — the knobs that DEFINE DSpark
 Copied straight from DeepSeek's V4-Flash/Pro DSpark configs + DeepSpec's hyperparameters, unchanged:
-`block_size=5` · `num_draft_layers=5` · `num_anchors=512` · `markov_rank=512` /
+`block_size=5` · `num_draft_layers=5` · `num_anchors=512` ·
 `markov_head_type=vanilla` · confidence head (with markov) · loss `0.9·L1 + 0.1·CE + 1.0·conf`,
 `loss_decay_gamma=4.0` · `lr=6e-4`, `warmup_ratio=0.04`, `weight_decay=0`, `max_grad_norm=1.0` ·
 `num_train_epochs=10` · on-policy data gen with `--disable-thinking` (their README's own example) ·
@@ -57,6 +66,7 @@ Copied straight from DeepSeek's V4-Flash/Pro DSpark configs + DeepSpec's hyperpa
 |---|---|---|---|
 | `target_layer_ids` | last-3 (Flash `[40,41,42]`, Pro `[58,59,60]`) | `[75,76,77]` | GLM has 78 layers; **same last-3 rule**, indices just follow the layer count |
 | `mask_token_id` | `128799` (their vocab) | `154821` | **same role** (a reserved/unused id), value comes from GLM's 154880-token vocab |
+| `markov_rank` | **Flash 256** / Pro 512 | `512` (our default) | scales with hidden size; GLM 6144 sits between Flash 4096 and Pro 7168. **To track Flash literally, set 256.** This is a *choice*, not a copy — pick by which V4 variant you're matching |
 | `hidden_size` / `vocab_size` | their model's | `6144` / `154880` | inherited — the draft deep-copies the target config; not a choice |
 
 **Why it doesn't disrupt 1:1:** the recipe *specifies* "last-3 layers" and "a reserved mask id" —

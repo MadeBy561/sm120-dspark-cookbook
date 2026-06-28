@@ -1,5 +1,10 @@
 # Serving the trained DSpark draft (vLLM b12x)
 
+> **Confidence: MEDIUM.** This page is from *image inspection*, not an executed end-to-end serve —
+> the build it documents was still training a draft when this was written. The capture → validate →
+> train legs are battle-tested; treat the exact serving invocation below as "the right image + where
+> to look," and expect to confirm the `method`/class name and config keys against your build.
+
 ## You need an image with BOTH GLM support AND DSpark
 
 Two distinct capabilities, and not every image has both:

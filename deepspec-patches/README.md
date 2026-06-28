@@ -2,7 +2,9 @@
 
 Apply against a fresh `git clone https://github.com/deepseek-ai/DeepSpec`:
 ```bash
-cd DeepSpec
+git clone https://github.com/deepseek-ai/DeepSpec && cd DeepSpec
+# the patch was cut against DeepSpec @ 0a03e19 ("first init"). If HEAD has moved and the patch
+# doesn't apply cleanly, pin it:  git checkout 0a03e19   (or 3-way merge:  git apply --3way)
 git apply /path/to/cookbook/deepspec-patches/deepspec-glm.patch
 cp /path/to/cookbook/deepspec-patches/config_dspark_glm52_full.py config/dspark/
 ```
