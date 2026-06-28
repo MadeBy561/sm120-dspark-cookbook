@@ -228,6 +228,30 @@ draft model never reads them anyway. **Verify before a long run** with a quick
 `draft_config.save_pretrained(tmpdir)` (see `scripts/diag/`-style check) — that single call exercises
 the same validator and takes seconds, vs discovering it an epoch in.
 
+## K. Checkpoints are ~50GB EACH — keep them OFF the root fs
+
+**Symptom:** training runs an epoch or two, then dies with an `iostream error` / `No space left on
+device` at a checkpoint save; the partial `step_N/` left behind has `model.safetensors` but a
+truncated `training_state.rank*.pt`.
+
+**Cause:** each checkpoint is **~50GB** — `model.safetensors` (~7.6GB) **plus the FSDP optimizer
+state** (`training_state.rank0/rank1.pt` ≈ 42GB combined: fp32 master params + Adam moments, and the
+full state incl. the frozen embed/lm_head). At `checkpointing_steps=100` they pile up fast and fill
+a normal root fs in two saves.
+
+**Fix:**
+- **Put checkpoints on a big volume** (NAS / scratch), e.g. mount it as `/root/checkpoints`. 15TB is
+  plenty; the root fs is not.
+- **Save less often** — `checkpointing_steps` = per-2-epochs (a few saves total), not every 100.
+- If on a slow NFS, expect a **~7min write stall per save** (50GB over 1GbE) and a **~7min reload**
+  of the optimizer state on resume. Tolerable for a few saves; painful if frequent.
+- The final/best **model** is only the 7.6GB `model.safetensors` — the 42GB optimizer state is
+  resume-only, safe to delete from older checkpoints if you need space (keep the latest for resume).
+
+**Resume note:** a clean resume needs the `step_latest` symlink (`save_checkpoint` writes it via
+`safe_symlink`; if a crash skipped it, recreate `ln -sfn step_N step_latest`). A relaunch then
+`AUTO-RESUME`s from it; without it, it silently trains from scratch.
+
 ## I. Honest expectations (so a weak smoke doesn't mislead you)
 
 A draft trained **from scratch** on a small set (a few thousand samples) competes against a target
