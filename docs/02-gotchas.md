@@ -198,6 +198,36 @@ sharp edges:
 
 ---
 
+## J. Checkpoint save crashes on GLM's per-layer config lists (the late-firing one)
+
+**Symptom:** training runs **fine for a whole epoch**, then **crashes at the first checkpoint save**:
+```
+ValueError: `num_hidden_layers` (5) must be equal to the number of `mlp_layer_types` (78)
+```
+(or `indexer_types`, or another per-layer list). It only fires inside `save_pretrained`, so you
+don't see it until the first `checkpointing_steps` boundary — **after burning an epoch.** The
+crash leaves a partial `step_N/` dir with `training_state.rank*.pt` but **no `config.json` /
+`model.safetensors`** (and no `step_latest` link, so a relaunch correctly starts fresh — but delete
+the partial dir so it doesn't confuse you).
+
+**Cause:** the draft config **deep-copies the GLM target config**, which carries per-layer LIST
+fields (`mlp_layer_types`, `indexer_types`, ...) sized to GLM's **78** layers. The draft has
+`num_draft_layers` (5), and transformers' config validator requires those lists to equal
+`num_hidden_layers`. Qwen3/Gemma targets don't have these fields → upstream DeepSpec never hits it.
+
+**Fix (in `deepspec-glm.patch`, `GlmDSparkTrainer._build_draft_model`):** after building the draft
+config, **truncate every per-layer list (length == target layer count) to the draft depth**:
+```python
+n_draft = int(draft_config.num_hidden_layers); n_target = int(target_config.num_hidden_layers)
+for name, val in list(vars(draft_config).items()):
+    if isinstance(val, (list, tuple)) and len(val) == n_target:
+        setattr(draft_config, name, type(val)(val[:n_draft]))
+```
+It's general (catches `mlp_layer_types` AND `indexer_types` AND any future per-layer field); the
+draft model never reads them anyway. **Verify before a long run** with a quick
+`draft_config.save_pretrained(tmpdir)` (see `scripts/diag/`-style check) — that single call exercises
+the same validator and takes seconds, vs discovering it an epoch in.
+
 ## I. Honest expectations (so a weak smoke doesn't mislead you)
 
 A draft trained **from scratch** on a small set (a few thousand samples) competes against a target

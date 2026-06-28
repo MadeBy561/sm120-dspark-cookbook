@@ -13,9 +13,12 @@ The patch is **small** (~60 lines across 4 files) and **adds GLM support without
 DSpark method**. Each change maps to a "Fidelity §3" item in the top-level README.
 
 ### `deepspec/trainer/dspark_trainer.py` — `GlmDSparkTrainer`
-A thin `class GlmDSparkTrainer(Qwen3DSparkTrainer): pass`. The DSpark trainer is **target-agnostic**
-— the draft is a standard transformer that consumes the target's hidden states, so the Qwen3 draft
-builder + loss work unchanged. **No method change.**
+`GlmDSparkTrainer(Qwen3DSparkTrainer)` overrides `_build_draft_model` for one GLM-only reason: after
+building the draft config (via the **unchanged** Qwen3 builder), it **truncates GLM's per-layer
+config lists** (`mlp_layer_types`, `indexer_types`) from the target's 78 entries to the draft's 5, so
+the first checkpoint `save_pretrained` doesn't crash on transformers' config validator (gotchas §J).
+The DSpark *method* is untouched — the draft is still the standard `Qwen3DSparkModel` consuming the
+target's hidden states; this is pure GLM-config compatibility, not a recipe change.
 
 ### `deepspec/trainer/__init__.py` — export it
 One line so the config can `from deepspec.trainer import GlmDSparkTrainer`.

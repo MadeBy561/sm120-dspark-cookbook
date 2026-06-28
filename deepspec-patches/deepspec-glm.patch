@@ -128,10 +128,10 @@ index 1a03dc8..b5d5687 100644
                      global_step=self.global_step,
                      next_micro_step=self.next_micro_step,
 diff --git a/deepspec/trainer/dspark_trainer.py b/deepspec/trainer/dspark_trainer.py
-index 487e99a..fe779c4 100644
+index 487e99a..d002f7f 100644
 --- a/deepspec/trainer/dspark_trainer.py
 +++ b/deepspec/trainer/dspark_trainer.py
-@@ -46,3 +46,17 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
+@@ -46,3 +46,33 @@ class Gemma4DSparkTrainer(Qwen3DSparkTrainer):
              model_args=model_args,
          )
          return Gemma4DSparkModel(draft_config)
@@ -146,6 +146,22 @@ index 487e99a..fe779c4 100644
 +    target config (hidden 6144, vocab 154880, 64x192 heads, rope) and overrides the
 +    DSpark fields; Qwen3DSparkModel reads only standard transformer fields, all of
 +    which GLM's config carries, so no GLM-specific draft modeling is required.
++
++    One GLM-only fix is needed at SAVE time: GLM's config carries per-layer LIST fields
++    (mlp_layer_types, index_topk_pattern, indexer_types, ...) sized to the target's layer count
++    (78). The deepcopied draft config keeps them, but the draft has num_draft_layers (5), so
++    transformers' config validator (len(mlp_layer_types) == num_hidden_layers) raises at
++    save_pretrained -> the FIRST checkpoint save crashes. Truncate every per-layer list to depth.
 +    """
 +
-+    pass
++    def _build_draft_model(self, *, target_config, model_args):
++        draft_config = build_qwen3_draft_config(
++            target_config=target_config,
++            model_args=model_args,
++        )
++        n_draft = int(draft_config.num_hidden_layers)
++        n_target = int(target_config.num_hidden_layers)
++        for _name, _val in list(vars(draft_config).items()):
++            if isinstance(_val, (list, tuple)) and len(_val) == n_target:
++                setattr(draft_config, _name, type(_val)(_val[:n_draft]))
++        return Qwen3DSparkModel(draft_config)
