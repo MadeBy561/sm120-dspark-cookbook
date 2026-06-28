@@ -42,6 +42,12 @@ just a loader that works for `GlmMoeDsa` and doesn't OOM. The draft, objective, 
 unchanged. (On a **full bf16 GLM-5.2**, transformers might load the target directly — but this patch
 works either way and is strictly safer on RAM, so keep it.)
 
+It also adds a **non-finite-gradient guard** in the training loop: skip `optimizer.step()` when
+`grad_norm` is inf/nan (drop the bad batch, preserve last-good weights) instead of poisoning every
+weight. This is standard spec-decode training hygiene that DeepSpec's loop lacks — without it,
+training dies on a single bad batch hundreds of steps in (gotchas §A, Mode 2). Lossless: one batch
+skipped, the objective is untouched.
+
 ---
 
 **Nothing in this patch touches** `block_size`, `num_anchors`, the markov head, the loss, the

@@ -5,10 +5,14 @@ training misbehaves, it is almost certainly one of these, not a flaw in DSpark.
 
 ---
 
-## A. `loss=nan` from step 1 (the big one)
+## A. `loss=nan` — TWO distinct failure modes (the big one)
 
-**Symptom:** training logs `loss=nan` from the first logged step and never recovers; a NaN
-optimizer step poisons every weight.
+There are **two** NaN mechanisms with **different causes and different fixes**. You need both: the
+config handles Mode 1, the patch handles Mode 2.
+
+### Mode 1 — NaN *from step 1*: deep grad-accum + too-short warmup
+
+**Symptom:** `loss=nan` from the very first logged step and never recovers.
 
 **What it is NOT** (we ruled these out, in order — don't re-walk them):
 - **Not the data.** Built `validate_cache.py` to scan every sample (finite check + supervised-token
@@ -43,6 +47,27 @@ small data, small `gbs` reproduces the recipe's update-count + warmup trajectory
 **If you want literal `gbs=512` on few GPUs:** implement **fp32 gradient accumulation** (accumulate
 into an fp32 buffer instead of the bf16 `param.grad`). ~20 lines in the training loop. Not needed if
 your accum depth is already shallow.
+
+### Mode 2 — NaN *after clean training*: a transient bad batch (the sneaky one)
+
+**Symptom:** trains **clean for hundreds of steps** (loss descending then stable), then **suddenly**
+`loss=nan` and stays there. The loss was *not* diverging — it spiked from one step to the next.
+(Observed on a clean accum-8 run: fine to step 210 at loss 2.59, **nan at step 220**.)
+
+**Cause:** a single bad batch / numerical spike — e.g. as the draft converges, its logits sharpen
+and a softmax in the loss overflows → an **inf/nan gradient**. `clip_grad_norm_` keeps it non-finite,
+then `optimizer.step()` writes NaN into **every** weight → nan forever. **Shallow accumulation does
+NOT prevent this** — it isn't an accumulation-precision problem, it's one poisoned step. Mode-1 fixes
+won't save you here.
+
+**Fix (in `deepspec-glm.patch`):** a **non-finite-gradient guard** in the training loop — when
+`grad_norm` is inf/nan, **skip** `optimizer.step()`, zero the grads, and continue. Last-good weights
+are preserved; you lose exactly one batch. This is standard EAGLE/spec-decode training hygiene, and
+DeepSpec's loop ships without it. After the patch you'll see occasional
+`[nan-guard] step N: ... skipped` lines instead of a dead run.
+
+**If skips become frequent** (many guarded steps, training stalls), the model is genuinely unstable —
+lower `lr` or clamp the logits in the loss. Rare skips (1 in hundreds) are harmless.
 
 **Diagnostics to reach for:** `scripts/diag/repro_nan2.py` (one fwd+bwd, prints non-finite grads),
 `scripts/diag/scan_data.py` (per-sample), `scripts/validate_cache.py --confirm` (fwd+bwd on flagged).

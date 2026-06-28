@@ -44,7 +44,7 @@ index 5ed28b0..6a51fdc 100644
      "Qwen3DSparkTrainer",
  ]
 diff --git a/deepspec/trainer/base_trainer.py b/deepspec/trainer/base_trainer.py
-index 1a03dc8..dbd0a5a 100644
+index 1a03dc8..7365e2e 100644
 --- a/deepspec/trainer/base_trainer.py
 +++ b/deepspec/trainer/base_trainer.py
 @@ -251,27 +251,39 @@ class BaseTrainer:
@@ -104,6 +104,29 @@ index 1a03dc8..dbd0a5a 100644
          return draft_model, tokenizer
  
      def _build_draft_model(self, *, target_config, model_args):
+@@ -380,7 +392,21 @@ class BaseTrainer:
+                     self.model,
+                     float(self.args.train.max_grad_norm),
+                 )
+-                self.optimizer.step()
++                # Non-finite-gradient guard. A rare bad batch / numerical spike (e.g. the draft's
++                # logits sharpen as it converges and a softmax overflows) yields an inf/nan grad;
++                # clipping keeps it non-finite, and optimizer.step() would then poison EVERY weight
++                # -> loss=nan forever. Skip the update (last-good weights preserved), drop the bad
++                # grads, and continue. Standard EAGLE/spec-decode training-stability guard; lossless
++                # (one batch skipped). Without it, shallow grad-accum trains clean for hundreds of
++                # steps then dies on a single batch (observed: clean to step 210, nan at 220).
++                if torch.isfinite(grad_norm):
++                    self.optimizer.step()
++                else:
++                    self.model.zero_grad(set_to_none=True)
++                    print_on_local_main(
++                        f"[nan-guard] step {self.global_step}: non-finite grad_norm "
++                        f"({grad_norm}); skipped optimizer step, dropped batch"
++                    )
+                 training_logger.on_optimizer_step(
+                     global_step=self.global_step,
+                     next_micro_step=self.next_micro_step,
 diff --git a/deepspec/trainer/dspark_trainer.py b/deepspec/trainer/dspark_trainer.py
 index 487e99a..fe779c4 100644
 --- a/deepspec/trainer/dspark_trainer.py
