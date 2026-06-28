@@ -42,6 +42,11 @@ python scripts/data/generate_train_data.py --model GLM-5.2 \
   --input-file-path train_datasets/perfectblend_train.jsonl \
   --output-file-path train_datasets/glm52/regen.jsonl
 ```
+> **Swap the sampling values for GLM's.** `--temperature/--top-p/--top-k/--min-p` above are
+> **Qwen3-4B's** recommended settings (DeepSpec's example). Per their README, adjust these to the
+> **target's** recommended sampling → use **GLM-5.2's** values. The flags (`--disable-thinking`,
+> `--max-tokens 4096`, `--resume`, `--concurrency`) stay as-is. Match how you'll serve GLM-5.2.
+
 On your 16-GPU box: run **many target replicas** and pass all their `--server-address`es — this
 stage is the real bottleneck and it parallelizes cleanly. Start with **50–100k** samples.
 

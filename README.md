@@ -183,6 +183,14 @@ python scripts/data/generate_train_data.py --model GLM-5.2 \
   --input-file-path train_datasets/perfectblend_train.jsonl \
   --output-file-path train_datasets/glm52/regen.jsonl
 ```
+> **Sampling values — adjust for GLM (per DeepSpec's README):** the `--temperature 0.7 --top-p 0.8
+> --top-k 20 --min-p 0` above are **Qwen3-4B's** recommended settings (DeepSpec's example defaults).
+> DeepSpec says to *"adjust the sampling parameters to match the recommended generation settings for
+> that model"* — so use **GLM-5.2's recommended** temp/top-p/top-k here. The *flags*
+> (`--disable-thinking`, `--max-tokens 4096`, `--resume`, `--concurrency`) are recipe-faithful as-is;
+> only the sampling *values* are target-specific. (Match how you'll actually **serve** GLM-5.2 — the
+> draft learns the distribution the target generates.)
+
 > Storage warning (DeepSpec's own): the hidden-state cache is **huge** (~38 TB for the full
 > open-perfectblend set at 3 captured layers). Start with 50–100k samples; that's enough for a
 > strong draft. Cache size scales with `#samples × seq_len × hidden × #layers`.
