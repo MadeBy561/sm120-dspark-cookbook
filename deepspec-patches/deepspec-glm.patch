@@ -44,7 +44,7 @@ index 5ed28b0..6a51fdc 100644
      "Qwen3DSparkTrainer",
  ]
 diff --git a/deepspec/trainer/base_trainer.py b/deepspec/trainer/base_trainer.py
-index 1a03dc8..7365e2e 100644
+index 1a03dc8..b5d5687 100644
 --- a/deepspec/trainer/base_trainer.py
 +++ b/deepspec/trainer/base_trainer.py
 @@ -251,27 +251,39 @@ class BaseTrainer:
@@ -71,7 +71,7 @@ index 1a03dc8..7365e2e 100644
 +        # Our NVFP4 glm_moe_dsa target can't load via AutoModelForCausalLM (custom arch + quant),
 +        # so read the (unquantized BF16) embed_tokens + lm_head weights straight from the safetensors.
 +        # Load each [154880,6144] weight STRAIGHT onto this rank's GPU (device=self.device) — never
-+        # into CPU RAM — and skip the fp32 nn.Embedding/nn.Linear intermediates. reaper has only 62 GB
++        # into CPU RAM — and skip the fp32 nn.Embedding/nn.Linear intermediates. a small host with ~62 GB
 +        # RAM; with torch.multiprocessing.spawn one worker per GPU, 4 workers each materializing two
 +        # fp32 [154880,6144] copies (3.8 GB ea) OOM-SIGKILLs. initialize_embeddings_and_head only reads
 +        # `.weight` (shape/detach/copy_), so a SimpleNamespace wrapping the GPU tensor suffices.

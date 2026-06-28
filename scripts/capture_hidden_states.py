@@ -38,7 +38,7 @@ RUN (when the GPUs are free)
 ----------------------------
   docker stop glm52-reap                       # free the 4 GPUs
   docker run --rm --gpus all --network host --ipc host --shm-size 32g \
-    -v /mnt/models:/mnt/models:ro -v /mnt/18tb_r1:/mnt/18tb_r1 -v /home/reaper/dspark:/work \
+    -v /path/to/models:/models:ro -v /path/to/cache:/cache -v /path/to/cookbook:/work \
     -e VLLM_USE_B12X_MOE=1 -e VLLM_USE_B12X_SPARSE_INDEXER=1 -e VLLM_USE_V2_MODEL_RUNNER=1 \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3 -w /work/DeepSpec -e PYTHONPATH=/work/DeepSpec \
     --entrypoint python3 dspark-gen:latest /work/capture_hidden_states.py \
