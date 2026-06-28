@@ -1,0 +1,61 @@
+# EXAMPLE: serve a standard-MHA DSpark/DFlash draft on a GLM-5.2 (MLA) target in vLLM.
+# Replace the placeholder paths (/models/..., /drafts/...) and the image tag with yours.
+#
+# This works ONLY with the four monkey-patches in scripts/serve_patch/sitecustomize.py mounted on
+# PYTHONPATH (see docs/04-serving.md). Without them, an MHA draft cannot serve next to the MLA
+# target (KV-dtype wall, rank-0 OOM, and KV-page-grouping AssertionError). The image must contain
+# GlmMoeDsa + the DFlash speculator (qwen3_dflash.py) + DSparkMarkovHead (for the markov head).
+services:
+  dspark-serve:
+    image: ${IMAGE:-your-registry/vllm-with-dflash-and-markov:latest}
+    container_name: dspark-serve
+    network_mode: host
+    ipc: host
+    shm_size: 32g
+    gpus: all
+    init: true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 1048576, hard: 1048576 }
+      stack: 67108864
+    volumes:
+      - /models:/models:ro                         # the GLM-5.2 target
+      - /drafts:/drafts:ro                          # the converted DFlash draft (convert_to_dflash.py output)
+      - ./serve_patch:/dspark-patch:ro              # the 4 monkey-patches (sitecustomize.py)
+      - ${CACHE_ROOT:-/root/.cache/vllm}:/cache
+    environment:
+      CUDA_VISIBLE_DEVICES: "0,1,2,3"
+      # the patch: sitecustomize.py teaches vLLM to serve the MHA draft (see docs/04-serving.md)
+      PYTHONPATH: "/dspark-patch"
+      MODEL: ${MODEL:-/models/GLM-5.2}
+      SERVED_MODEL_NAME: GLM-5.2
+      PORT: "5001"
+      TP_SIZE: "4"
+      DCP_SIZE: "${DCP_SIZE:-4}"
+      DRAFT_MODEL: "${DRAFT_MODEL:-/drafts/dflash_draft}"
+      DRAFT_TOKENS: "${DRAFT_TOKENS:-5}"            # = block_size
+      DRAFT_KV_CACHE_DTYPE: "${DRAFT_KV_CACHE_DTYPE:-auto}"   # draft's OWN KV dtype (NOT the target's fp8_ds_mla)
+      DRAFT_ATTN_BACKEND: "${DRAFT_ATTN_BACKEND:-FLASH_ATTN}" # non-MLA backend for the standard-attn draft
+      GPU_MEMORY_UTILIZATION: "${GPU_MEMORY_UTILIZATION:-0.92}"
+      # NB: the MHA draft needs its OWN KV pool (it can't share the MLA latent), so context is tighter
+      # than the target's native max. Size MAX_MODEL_LEN to fit BOTH pools (see the KV-memory note in 04).
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-16384}"
+      MAX_NUM_SEQS: "${MAX_NUM_SEQS:-4}"
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$${DRAFT_MODEL}\",\"num_speculative_tokens\":$${DRAFT_TOKENS},\"draft_kv_cache_dtype\":\"$${DRAFT_KV_CACHE_DTYPE}\",\"draft_attention_backend\":\"$${DRAFT_ATTN_BACKEND}\"}")
+        exec vllm serve "$${MODEL}" \
+          --served-model-name "$${SERVED_MODEL_NAME}" --host 0.0.0.0 --port "$${PORT}" \
+          --trust-remote-code \
+          --tensor-parallel-size "$${TP_SIZE}" --decode-context-parallel-size "$${DCP_SIZE}" \
+          --quantization compressed-tensors --kv-cache-dtype fp8 --moe-backend b12x \
+          --load-format fastsafetensors \
+          --gpu-memory-utilization "$${GPU_MEMORY_UTILIZATION}" \
+          --max-model-len "$${MAX_MODEL_LEN}" --max-num-seqs "$${MAX_NUM_SEQS}" \
+          --reasoning-parser glm45 \
+          "$${SPEC_ARGS[@]}"
+        # do NOT force a global --attention-backend: the MLA target auto-selects its sparse-MLA backend
+        # while the standard-attn draft uses DRAFT_ATTN_BACKEND. Forcing one breaks the other.

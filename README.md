@@ -17,6 +17,24 @@ written so you can point it at the **full GLM-5.2** on a bigger sm120 box and tu
 
 ---
 
+## Serving + speed reality (read this before you size expectations)
+
+- **It serves.** A standard-MHA DSpark/DFlash draft **does** run and generate tokens on a GLM-5.2
+  (MLA) target in vLLM — but only via **four monkey-patches** (an MHA draft hits the same KV walls
+  EAGLE3 does; they're patchable, not fundamental). Full recipe + honest limits in
+  [`docs/04-serving.md`](docs/04-serving.md); the patch is `scripts/serve_patch/sitecustomize.py`.
+- **Speed comes from the target, not the draft.** `t/s = forward_rate × accept_length`. The
+  `forward_rate` is set by HBM bandwidth ÷ active params (and scales with GPU count); a draft only
+  lifts `accept_length`. So a draft that gives ~300 t/s on a 7.6B-active model gives roughly
+  `300 ÷ (active_params / 7.6B)` on a heavier one. **A heavy target on few GPUs caps low no matter
+  how good the draft** — size your target + GPU count with that formula, not with a draft's hype.
+- **MHA draft costs context.** It can't share the target's compact MLA KV, so it needs its **own** KV
+  pool (~5 GB/GPU at 245k tokens) → you serve a shorter context. An **MLA-backbone** draft shares the
+  latent KV (full context, native serving) but is a *different architecture*. MHA = short-context +
+  zero-retrain; MLA = long-context. Same speed ceiling either way.
+
+---
+
 ## What DSpark is (30 seconds)
 
 DSpark is DeepSeek's speculative-decoding method (the successor to DFlash/EAGLE-3). The draft

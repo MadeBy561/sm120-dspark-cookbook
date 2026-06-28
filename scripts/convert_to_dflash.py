@@ -40,20 +40,52 @@ cfg["draft_vocab_size"] = int(cfg["vocab_size"])          # full vocab, identity
 cfg["dspark_markov_rank"] = int(cfg.get("markov_rank", 512))  # consumed by the markov monkey-patch
 cfg["num_lookahead_tokens"] = int(cfg.get("block_size", 5))   # block_size proposals
 
+# vLLM's get_parallel_drafting_token_id() REQUIRES dflash_config.mask_token_id (raises ValueError
+# otherwise) and it MUST equal the mask token the draft trained with, or the block-position
+# embeddings are unfamiliar and accept collapses. Propagate the training mask_token_id.
+_mask_tok = cfg.get("mask_token_id")
+if _mask_tok is None:
+    raise SystemExit("source config has no mask_token_id; DFlash parallel-drafting needs it "
+                     "(set --opts model.mask_token_id during training, or add it here).")
+cfg["dflash_config"]["mask_token_id"] = int(_mask_tok)
+
 os.makedirs(OUT, exist_ok=True)
 with open(os.path.join(OUT, "config.json"), "w") as f:
     json.dump(cfg, f, indent=2)
 
-# --- weights: pass through via symlink (keeps markov_head.* + confidence_head.*) ---
+# --- weights: strip the draft's OWN embed_tokens (redundant) + write a fresh safetensors ---
+# The draft froze a bf16 copy of the target's embed_tokens. At serve time load_dflash_model SHARES
+# the target's (NVFP4) embed, and vLLM's DFlash load_weights auto-skips embed when it's absent. So
+# the draft never needs its own copy: dropping it avoids loading ~0.95B bf16 params onto the (already
+# ~92GB-full) rank-0 GPU next to the 594B target. We keep markov_head.* / confidence_head.* / layers
+# / fc / lm_head. (lm_head is also shared post-load, but the standard CPU-staged loader makes its
+# load cheap, so we keep it to avoid any strict-loader complaint.)
+from safetensors.torch import load_file, save_file  # noqa: E402
+
 dst_w = os.path.join(OUT, "model.safetensors")
 if os.path.lexists(dst_w):
     os.remove(dst_w)
-os.symlink(os.path.join(SRC, "model.safetensors"), dst_w)
+# What the plain DFlash backbone loads: layers.* + fc.* + lm_head + norms. Drop tensors it doesn't
+# model:
+#   embed_tokens   -> shared from the target (NVFP4), auto-skipped by DFlash load_weights
+#   confidence_head -> DSpark TRAINING-only head; vLLM spec-decode uses target rejection-sampling, never served
+#   markov_head    -> DSpark serial head; NOT in the DFlash backbone. Stripped for the backbone bring-up;
+#                     re-added in stage 2 via the markov monkey-patch (keep KEEP_MARKOV=1 to retain it).
+_keep_markov = os.environ.get("KEEP_MARKOV", "0") == "1"
+_strip_subs = ["embed_tokens", "confidence_head"] + ([] if _keep_markov else ["markov"])
+_sd = load_file(os.path.join(SRC, "model.safetensors"))
+_dropped = [k for k in list(_sd) if any(s in k for s in _strip_subs)]
+for _k in _dropped:
+    del _sd[_k]
+save_file(_sd, dst_w, metadata={"format": "pt"})
+print(f"  stripped {_dropped}")
+print(f"  wrote {len(_sd)} tensors (KEEP_MARKOV={_keep_markov})")
 
 print(f"converted -> {OUT}")
 print(f"  architectures -> {cfg['architectures']}")
 print(f"  dflash_config.target_layer_ids -> {cfg['dflash_config']['target_layer_ids']}  (i+1 => {src_tli})")
 print(f"  draft_vocab_size -> {cfg['draft_vocab_size']} (full)  | dspark_markov_rank -> {cfg['dspark_markov_rank']}")
+print(f"  dflash_config.mask_token_id -> {cfg['dflash_config']['mask_token_id']} (parallel-drafting mask, = training)")
 print("  model.safetensors -> symlinked (q/k/v fused at load; markov/confidence weights carried)")
 print("NOTE: serve with the model PATH containing 'dflash' (auto-detect) OR --speculative-config method=dflash;")
 print("      full DSpark needs the markov monkey-patch (next).")

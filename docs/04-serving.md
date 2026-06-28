@@ -1,77 +1,71 @@
-# Serving the trained DSpark draft (vLLM b12x)
+# Serving the trained DSpark draft on vLLM (MLA target)
 
-> **Confidence: SCOPED, not yet served end-to-end.** This page is now code-level (we read the
-> serving sources), but the serve-test itself hasn't run yet. The capture → validate → train legs
-> are battle-tested; the serving path below is the *correct, viable* one (the obvious alternative is
-> a proven dead end — see below), with two config details to confirm when you actually load it.
+> **Confidence: SERVED END-TO-END.** A standard-MHA DSpark/DFlash draft now boots and **generates
+> tokens** on a GLM-5.2 (MLA) target in vLLM, via four monkey-patches (no image rebuild). An earlier
+> version of this page claimed *"DFlash avoids the EAGLE3 KV wall"* — **that was wrong.** A DFlash
+> draft is *also* standard multi-head attention, so it hits the **same** wall EAGLE3 does. The
+> difference is that the wall is **patchable** — and the patches are below.
 
-## The key finding: vLLM's `dspark` method is **MLA-only** — don't use it for a DeepSpec draft
+## Why an MHA draft fights an MLA target (the root cause)
 
-It's tempting to serve via vLLM's `dspark` speculator (`models/deepseek_v4/nvidia/dspark.py`). **It
-won't load a DeepSpec draft.** That class (`DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer)`) is
-DeepSeek-V4 **MLA** attention (`wq_a`/`wq_b`/`wkv`/`kv_norm`, even in its `_dspark_use_separate_qkv`
-mode — that's unfused-MLA, not standard MHA) and its `load_weights` only takes weights **bundled
-under `mtp.*`** in the target checkpoint. A DeepSpec draft is the opposite: **standard MHA**
-(`q_proj`/`k_proj`/`v_proj`/`o_proj`) in a **separate** `layers.N.*` checkpoint. Wrong attention,
-wrong namespace — not a rename.
+GLM-5.2's target uses **MLA** attention: its KV cache is a single compact latent (~576 B/token,
+`fp8_ds_mla` format). The open DeepSpec recipe builds a **standard-MHA** draft (`q/k/v_proj`, full
+heads). vLLM's MLA-serving path was written assuming the draft is *also* MLA (DeepSeek's V4 draft
+is). So an MHA draft trips three assumptions, each of which is fixable:
 
-## The path that works: **DFlash backbone + markov monkey-patch**
+1. **KV dtype.** vLLM resolves `kv_cache_dtype` *globally* from the MLA target → hands the MHA draft
+   `fp8_ds_mla`, which **no non-MLA attention backend supports**. *(This is the exact wall that
+   "killed" EAGLE3 — it was never EAGLE3-specific.)*
+2. **Load OOM.** The target nearly fills each GPU; `fastsafetensors`' sharded NCCL shuffle
+   materializes each full (unsharded) draft tensor on rank-0 → OOM next to the target.
+3. **KV-page grouping.** The MHA draft's KV page (e.g. `16 heads × 64 × 2(K,V) × 2 bytes = 2048`
+   elem/token) is **much larger** than the MLA latent page (576 B/token), so vLLM can't pad it into
+   an MLA "bucket" → `AssertionError: max(sm_page_sizes) <= max(all_page_sizes)`.
 
-`DFlashDraftModel → DFlashQwen3ForCausalLM` (`qwen3_dflash.py`) **is** standard MHA, and its
-`load_weights` **fuses `q/k/v→qkv` and `gate/up→gate_up` at load** — so a DeepSpec draft's separate
-projections + `fc`/`hidden_norm`/`norm`/`embed_tokens`/`lm_head` pass through nearly unchanged. The
-markov head you trained is **identical** to the image's `DSparkMarkovHead` (`markov_w1`+`markov_w2`,
-reads `dspark_markov_rank`). So full DSpark = **DFlash + port the markov head**, no image rebuild.
+## The recipe: 4 monkey-patches + the converter
 
-**(1) Convert** — `scripts/convert_to_dflash.py` (config remap + weight symlink):
-```bash
-python3 scripts/convert_to_dflash.py /path/to/deepspec/step_NNN /path/to/dflash_out
-```
-It sets `architectures=["DFlashDraftModel"]`, `dflash_config.target_layer_ids = [t-1 for t in
-target_layer_ids]` (vLLM does `i+1` → your `[75,76,77]`; **`speculative.py:407`**), and
-`draft_vocab_size = vocab_size` (full, identity). Weights are symlinked (the markov + confidence
-tensors ride along for the patch).
+All four live in **`scripts/serve_patch/sitecustomize.py`** (auto-imported by every vLLM process,
+including the TP workers, when its directory is on `PYTHONPATH` — no image rebuild) plus
+**`scripts/convert_to_dflash.py`**:
 
-**Two things to confirm at the serve-test** (can't be verified from config alone):
-- **aux-layer convention** — DeepSpec captures the residual *entering* layers 75/76/77; confirm the
-  served draft receives the *same* aux hidden it trained on (input-of-layer vs output-of-layer; the
-  `i+1` is set to round-trip, but verify).
-- **full vocab** — DFlash usually uses a *reduced* `draft_vocab_size` + `t2d`/`d2t` maps; we serve
-  full-vocab (no maps). If your build requires the maps, add identity ones in the converter.
+| # | patch | what it does |
+|---|---|---|
+| 1 | `load_dflash_model` honors **`draft_kv_cache_dtype`** | the stock dflash loader ignores it; the patch gives the MHA draft its **own bf16 KV** (set `draft_kv_cache_dtype: "auto"` in `--speculative-config`) instead of the target's `fp8_ds_mla`. Set `draft_attention_backend: "FLASH_ATTN"` so the standard-attn draft gets a non-MLA backend. |
+| 2 | draft loads with **`load_format="safetensors"`** | the patch overrides the draft's loader to the standard CPU-staged one (no rank-0 GPU spike from `fastsafetensors`' shuffle). |
+| 3 | **strip** `embed_tokens` + `confidence_head` (+ `markov` for the DFlash-only backbone) | in the converter. `embed_tokens` is shared from the target (DFlash `load_weights` auto-skips it when absent); `confidence_head` is a training-only head vLLM never serves. Pass `KEEP_MARKOV=1` to retain the markov weights for full DSpark. **Also set `dflash_config.mask_token_id` = the training mask token** — `get_parallel_drafting_token_id` raises without it. |
+| 4 | `_get_kv_cache_groups_uniform_groups` **own-group fallback** | on the page-size `AssertionError`, emit the draft as its **own** `KVCacheGroupSpec` (its native page) instead of forcing it into an MLA bucket → heterogeneous KV groups coexist. |
 
-**(2) Markov monkey-patch** — a mounted `.py` on `PYTHONPATH` (no image rebuild) that adds
-`DSparkMarkovHead` to the DFlash proposer and wires the per-block markov correction into its draft
-sampling. (Build + validate this at the serve-test; the DFlash backbone alone serves first for a
-DFlash-level accept number, then markov for full DSpark.)
+Then **size `--max-model-len` to fit two KV pools** (target MLA + draft MHA). The dual pools cost
+memory, so you'll run a shorter context than the target's native max — vLLM tells you the ceiling
+(`estimated maximum model length is N`); set `max_model_len` at or below it (we used 16k).
 
-## EAGLE3 is *also* a dead end on an MLA target in vLLM
-A generic EAGLE3 Llama head (e.g. `AQ-MedAI/GLM-5.1-eagle3`) **loads** (dims match) but **can't
-serve**: the MLA target requires `fp8_ds_mla` KV, and no standard attention backend supports that
-for the Llama draft (vLLM resolves KV dtype globally from the target). It "works" only in llama.cpp.
-This is why DSpark-via-DFlash (built around the standard-MHA draft) is the right path, not a
-bolt-on EAGLE3.
+Boot with `serving/docker-compose.dflash-example.yml` (mounts `serve_patch/` on `PYTHONPATH`).
+
+## Honest limits — read before you invest
+
+- **Accept is training-driven, not architecture-driven.** An undertrained draft accepts ~nothing →
+  it's *slower* than no draft (it runs every step for ~0 benefit). Finish training before judging.
+- **The MHA draft needs its OWN KV pool** (it can't share the MLA latent). At long context that pool
+  is large (≈5 GB/GPU at 245k tokens with a 5-layer draft) → you **lose context**. This is the MHA
+  path's real cost.
+- **Speed ceiling is the *target's* `forward_rate`, not the draft.** `t/s = forward_rate ×
+  accept_length`. `forward_rate` is set by HBM bandwidth ÷ active params (and scales with GPU count);
+  a draft only lifts `accept_length`. So the same draft that gives, say, 300 t/s on a 7.6B-active
+  model gives roughly `300 ÷ (your_active_params / 7.6B)` on a heavier one. Pick your target and GPU
+  count with that formula in mind — a heavy model on few GPUs caps low no matter how good the draft.
+- **MHA vs MLA draft.** MHA **serves** (via these patches) but costs context (separate KV pool). An
+  **MLA-backbone** draft shares the target's latent KV → no extra pool, full context, native
+  `dspark.py` serving (no patches) — but it's a *different draft architecture*, and DeepSeek's
+  `dspark.py` loader is V4-specific (a GLM target needs its own MLA-draft serving path). Same speed
+  ceiling either way. **Choose MHA for short-context + zero-retrain; choose MLA only if you need long
+  context with the draft** (it's a context optimization, not a speed one).
 
 ## Which image
-| image | serves GLM (`GlmMoeDsa`) | DFlash | markov head to port |
-|---|---|---|---|
-| `voipmonitor/vllm:eldritch-...` | ✅ | ✅ (`qwen3_dflash.py`) | ❌ |
-| `voipmonitor/vllm:ds4dspark-v7-...` | ✅ | ✅ | ✅ (`DSparkMarkovHead` to copy) |
-
-Use **`ds4dspark`** — it has DFlash *and* the `DSparkMarkovHead` source for the patch. Verify:
-```bash
-docker run --rm --entrypoint bash <image> -c '
-  V=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))")
-  grep -rl "class DFlashQwen3ForCausalLM" $V/model_executor/models/   # DFlash serving
-  grep -rl "class DSparkMarkovHead" $V/models/ $V/model_executor/      # markov head to port
-'
-```
-
-## sm120 / TP / DCP caveats
-Serving a Llama-style draft alongside the MLA target: **don't force a global `--attention-backend`**
-(the MLA backend is invalid for the standard-attention draft — let vLLM auto-select per model), and
-**DCP works on B12X** (FlashInfer-MLA-sparse threw a DCP-vs-draft-KV-heads assertion; B12X didn't).
-Confirm the target boots at your TP/DCP before wiring the draft.
+The image must contain `GlmMoeDsa` (the target), the **DFlash speculator** (`qwen3_dflash.py`,
+`DFlashSpeculator`) for the standard-MHA draft, and **`DSparkMarkovHead`** (in `dspark.py`) to port
+the markov head. The plain DFlash backbone serves first (a DFlash-level accept number); add the
+markov head for full DSpark.
 
 ## Reminder
-The draft is bonded to the target it was **captured from**. Serve it on that same model (full
-GLM-5.2 → the full-GLM draft); a REAP-captured draft under-accepts on full GLM-5.2 and vice-versa.
+The draft is bonded to the target it was **captured from**. Serve it on that exact model — a draft
+captured from one checkpoint under-accepts on a different one.
